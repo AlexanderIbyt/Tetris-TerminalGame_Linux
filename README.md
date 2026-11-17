@@ -62,6 +62,3 @@ The whole program is **~500 lines of ibyt** and runs **without an
 operating system, without libc, without a runtime** – just the terminal,
 the IBYT libraries and the CPU. It is a real, playable game written in
 the same language that the compiler is written in.
-
-For a bare-metal variant of the same game (VBE graphics, PC speaker,
-own clock, **11.8 KB**), see `tetris-bare`.
