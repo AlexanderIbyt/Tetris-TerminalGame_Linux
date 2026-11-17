@@ -1,0 +1,794 @@
+// Tetris – Konsolen-Spiel in ibyt (Version 1.2 – skalierbare Zellen)
+// Steuerung: Pfeil links/rechts (A / D), Pfeil hoch (W) dreht, Pfeil runter (S) schneller,
+// Leertaste = sofort fallen, p = Pause, q / ESC = Ende, r = neues Spiel.
+// Kollision und volle Zeilen werden mit GetPoint am Bild gelesen – keine Feldtabelle.
+// Das Spiel rechnet in Zellen (Raster 10 x 20). Jede Zelle ist Field.Cell x Field.Cell Punkte gross;
+// Start waehlt die groesste Zellgroesse (3, 2 oder 1), die ins Terminal passt.
+
+import <Basic.ibyt>
+import <ConsoleGfx.ibyt>
+import <Sound.ibyt>
+
+// ================= EINSTELLUNGEN =================
+private define LOOP_MS:         10
+private define DROP_START:      50
+private define DROP_MIN:        5
+private define LEVEL_STEP:      5
+private define LINES_PER_LEVEL: 10
+private define CELL_MAX:        3
+// =================================================
+
+private define C_WALL: 8
+private define FIELD_W: 10
+private define FIELD_H: 20
+private define SPAN_W: 18
+private define SPAN_H: 21
+
+// ---- Daten ----
+private int32 Shapes[28]: {3840, 8738, 240, 17476, 17600, 36352, 25664, 3616, 17504, 3712, 50240, 11776, 52224, 52224, 52224, 52224, 1728, 35904, 27648, 17952, 3648, 19520, 19968, 17984, 3168, 19584, 50688, 9792}
+private byte  PColor[7]: {51, 21, 208, 226, 46, 129, 196}
+private int64 Kick[5]: {0, -1, 1, -2, 2}
+private int64 LineScore[5]: {0, 100, 300, 500, 800}
+
+private byte SndLock[]:   {12, 4, 0, 0}
+private byte SndLine[]:   {24, 8, 31, 8, 0, 0}
+private byte SndTetris[]: {24, 4, 28, 4, 31, 4, 36, 16, 0, 0}
+private byte SndOver[]:   {19, 8, 12, 16, 0, 0}
+
+// ---- Container ----
+private int64 Field{ OX: 0, OY: 0, Cell: 1 }
+private int64 Piece{ Type: 0, Rot: 0, X: 0, Y: 0, NextType: 0, PrevMask: 0 }
+private int64 Try{ X: 0, Y: 0, Rot: 0, Hit: 0 }
+private int64 Dm{ Mask: 0, X: 0, Y: 0, Col: 0 }
+private int64 Line{ X: 0, Y: 0, Rot: 0, Kick: 0, Cleared: 0 }
+private int64 Blk{ X: 0, Y: 0, Dx: 0, Dy: 0, Col: 0 }
+private int64 Game{ Score: 0, Best: 0, Lines: 0, Level: 0, DropAt: 0, Tick: 0, Quit: 0, Paused: 0, Over: 0 }
+
+// ----------------------------------------------------------------
+// Punkt in Farbe: $b = x, $t = y, $w = Farbe
+prepare $b@X, $t@Y, $w@Color
+private methode Plot(_, base, temp, work, index, counter, slot, item, admin){
+    $c: $b
+
+    prepare $w@Color
+    call ConsoleGfx.SetPointColor(keep base)
+
+    prepare $c@X, $t@Y
+    call ConsoleGfx.SetPoint(base, keep temp, index, counter, slot, item, admin)
+}
+
+// Punkt loeschen
+prepare $b@X, $t@Y
+private methode Erase(_, base, temp, work, index, counter, slot, item, admin){
+
+    prepare $b@X, $t@Y
+    call ConsoleGfx.SetPoint(base, keep temp, index, counter, slot, item, admin)
+
+    call ConsoleGfx.ClearPoint(focus base, focus counter, item, admin)
+}
+
+// Zelle (GridX, GridY) im Raster = Cell x Cell Punkte; Farbe 0 loescht die Zelle
+prepare $b@GridX, $t@GridY, $w@Color
+private methode PutCell(_, base, temp, work, index, counter, slot, item, admin){
+    Blk.Col: @Color
+    @GridX *: Field.Cell
+    @GridX +: Field.OX
+    Blk.X: @GridX
+    @GridY *: Field.Cell
+    @GridY +: Field.OY
+    Blk.Y: @GridY
+    Blk.Dy: 0
+
+    ->Row
+        Blk.Dx: 0
+
+        ->Col
+            $b@X: Blk.X + Blk.Dx
+            $t@Y: Blk.Y + Blk.Dy
+            $w@Color: Blk.Col
+            compare(@Color = 0) goto_true Del
+
+            prepare $b@X, $t@Y, $w@Color
+            call Plot(_, base, temp, work, index, counter, slot, item, admin)
+            goto Step
+
+            ->Del
+            prepare $b@X, $t@Y
+            call Erase(_, base, temp, work, index, counter, slot, item, admin)
+
+            ->Step
+            $b@Dx: Blk.Dx
+            @Dx++
+            Blk.Dx: @Dx
+            $w@Size: Field.Cell
+            compare(@Dx < @Size) goto_true Col↑
+
+        $b@Dy: Blk.Dy
+        @Dy++
+        Blk.Dy: @Dy
+        $w@Size: Field.Cell
+        compare(@Dy < @Size) goto_true Row↑
+}
+
+// Farbe der Zelle (GridX, GridY): _ = Farbe, Carry = belegt
+prepare $b@GridX, $t@GridY
+private methode PeekCell(_, base, temp){
+    $b *: Field.Cell
+    $b +: Field.OX
+    $t *: Field.Cell
+    $t +: Field.OY
+
+    prepare $b@GridX, $t@GridY
+    call ConsoleGfx.GetPoint(_, keep base, keep temp)
+}
+
+// Maske Dm.Mask an (Dm.X, Dm.Y) zeichnen (Dm.Col > 0) oder loeschen (Dm.Col = 0)
+private methode DrawMask(_, base, temp, work, index, counter, slot, value, unit, item, admin){
+    $u@Mask: Dm.Mask
+    $v@Bit: 0
+
+    ->Bit
+        $b@Bits: @Mask
+        @Bits &: 32768
+        compare(@Bits = 0) goto_true Skip
+
+        $b@GridX: @Bit & 3
+        @GridX +: Dm.X
+        $t@GridY: @Bit / 4
+        @GridY +: Dm.Y
+        $w@Color: Dm.Col
+
+        prepare $b@GridX, $t@GridY, $w@Color
+        call PutCell(_, base, temp, work, index, counter, slot, item, admin)
+
+        ->Skip
+        @Mask <<: 1
+        @Bit++
+        compare(@Bit < 16) goto_true Bit↑
+}
+
+// Ist ein Feld der Maske belegt? -> Try.Hit = 1
+private methode Blocked(_, base, temp, work, index, counter, slot, value, unit){
+    Try.Hit: 0
+    $u@Mask: Dm.Mask
+    $v@Bit: 0
+
+    ->Bit
+        $b@Bits: @Mask
+        @Bits &: 32768
+        compare(@Bits = 0) goto_true Skip
+
+        $b@GridX: @Bit & 3
+        @GridX +: Dm.X
+        $t@GridY: @Bit / 4
+        @GridY +: Dm.Y
+
+        prepare $b@GridX, $t@GridY
+        call PeekCell(_, base, temp)
+        goto_flag not_carry Skip
+        Try.Hit: 1
+        return
+
+        ->Skip
+        @Mask <<: 1
+        @Bit++
+        compare(@Bit < 16) goto_true Bit↑
+}
+
+// Stein mit (Try.X, Try.Y, Try.Rot) versuchen
+private methode TryMove(_, base, temp, work, index, counter, slot, value, unit, item, admin){
+    // aktuellen Stein loeschen
+    $i: Piece.Type
+    $i *: 4
+    $i +: Piece.Rot
+    $u: Shapes[$i]
+    Dm.Mask: $u
+    Dm.X: Piece.X
+    Dm.Y: Piece.Y
+    Dm.Col: 0
+    call DrawMask(_, base, temp, work, index, counter, slot, value, unit, item, admin)
+
+    // Ziel pruefen
+    $i: Piece.Type
+    $i *: 4
+    $i +: Try.Rot
+    $u: Shapes[$i]
+    Dm.Mask: $u
+    Dm.X: Try.X
+    Dm.Y: Try.Y
+    call Blocked(_, base, temp, work, index, counter, slot, value, unit)
+
+    $b: Try.Hit
+    compare($b = 1) goto_true Back
+    Piece.X: Try.X
+    Piece.Y: Try.Y
+    Piece.Rot: Try.Rot
+
+    ->Back
+        // Stein zeichnen
+        $i: Piece.Type
+        $i *: 4
+        $i +: Piece.Rot
+        $u: Shapes[$i]
+        Dm.Mask: $u
+        Dm.X: Piece.X
+        Dm.Y: Piece.Y
+        $i: Piece.Type
+        $u: PColor[$i]
+        Dm.Col: $u
+        call DrawMask(_, base, temp, work, index, counter, slot, value, unit, item, admin)
+}
+
+// Ist Zeile Line.Y voll? -> Try.Hit = 1
+private methode RowFull(_, base, temp, work, index, counter, slot, value, unit){
+    Try.Hit: 1
+    Line.X: 0
+
+    ->Next
+        $b@GridX: Line.X
+        $t@GridY: Line.Y
+        prepare $b@GridX, $t@GridY
+        call PeekCell(_, base, temp)
+        goto_flag carry Ok
+        Try.Hit: 0
+        return
+
+        ->Ok
+            $b@Col: Line.X
+            @Col++
+            Line.X: @Col
+            compare(@Col < FIELD_W) goto_true Next↑
+}
+
+// Zeile Line.Rot-1 nach Line.Rot kopieren
+private methode CopyRow(_, base, temp, work, index, counter, slot, value, unit, item, admin){
+    Line.X: 0
+
+    ->Next
+        $b@GridX: Line.X
+        $t@GridY: Line.Rot - 1
+        prepare $b@GridX, $t@GridY
+        call PeekCell(_, base, temp)
+        goto_flag carry Has
+
+        $b@GridX: Line.X
+        $t@GridY: Line.Rot
+        $w@Color: 0
+        goto Put
+
+        ->Has
+            $w@Color: _
+            $b@GridX: Line.X
+            $t@GridY: Line.Rot
+
+        ->Put
+            prepare $b@GridX, $t@GridY, $w@Color
+            call PutCell(_, base, temp, work, index, counter, slot, item, admin)
+
+            $b@Col: Line.X
+            @Col++
+            Line.X: @Col
+            compare(@Col < FIELD_W) goto_true Next↑
+}
+
+// oberste Zeile leeren
+private methode EraseTop(_, base, temp, work, index, counter, slot, value, unit, item, admin){
+    Line.X: 0
+
+    ->Next
+        $b@GridX: Line.X
+        $t@GridY: 0
+        $w@Color: 0
+        prepare $b@GridX, $t@GridY, $w@Color
+        call PutCell(_, base, temp, work, index, counter, slot, item, admin)
+
+        $b@Col: Line.X
+        @Col++
+        Line.X: @Col
+        compare(@Col < FIELD_W) goto_true Next↑
+}
+
+// Volle Zeilen entfernen
+private methode ClearLines(_, base, temp, work, index, counter, slot, value, unit, item, admin){
+    Line.Cleared: 0
+    Line.Y: 19
+
+    ->Row
+        call RowFull(_, base, temp, work, index, counter, slot, value, unit)
+        $b@Hit: Try.Hit
+        compare(@Hit = 0) goto_true NextRow
+        $b@Count: Line.Cleared
+        @Count++
+        Line.Cleared: @Count
+        Line.Rot: Line.Y
+
+        ->Shift
+            $b@Rot: Line.Rot
+            compare(@Rot = 0) goto_true Top
+            call CopyRow(_, base, temp, work, index, counter, slot, value, unit, item, admin)
+            $b@Rot: Line.Rot
+            @Rot--
+            Line.Rot: @Rot
+            goto Shift↑
+
+        ->Top
+        call EraseTop(_, base, temp, work, index, counter, slot, value, unit, item, admin)
+        goto Row↑
+
+        ->NextRow
+        $b@Y: Line.Y
+        compare(@Y = 0) goto_true Done
+        @Y--
+        Line.Y: @Y
+        goto Row↑
+
+    ->Done->
+}
+
+// Zeile mit Punkten, Zeilen, Level, Rekord
+private methode ShowScore(_, base, temp, work, index, counter, slot, value, unit, item, admin){
+    prepare "\e[0m\e["
+    call Basic.Print(keep base, item, admin)
+    
+    $b: ConsoleGfx.consoleGfxPub64.Height
+    $b++
+    prepare $b
+    call Basic.PrintInt(=)
+    
+    prepare ";1H Punkte: "
+    call Basic.Print(=)
+    
+    prepare Game.Score
+    call Basic.PrintInt(=)
+    
+    prepare "   Zeilen: "
+    call Basic.Print(=)
+    
+    prepare Game.Lines
+    call Basic.PrintInt(=)
+    
+    prepare "   Level: "
+    call Basic.Print(=)
+    
+    prepare Game.Level
+    call Basic.PrintInt(=)
+    
+    prepare "   Rekord: "
+    call Basic.Print(=)
+    
+    prepare Game.Best
+    call Basic.PrintInt(=)
+    
+    $b: Game.Paused
+    compare($b = 1) goto_true Pause
+    $pB: "   p = Pause, q = Ende   "
+    goto Out
+
+    ->Pause
+    	$pB: "   *** PAUSE ***   (p = weiter)  "
+
+    ->Out
+        prepare $b@Text
+    	call Basic.Print(=)
+}
+
+// naechsten Stein setzen und Vorschau erneuern
+private methode Spawn(_, base, temp, work, index, counter, slot, value, unit, item, admin){
+
+    // alte Vorschau loeschen
+    Dm.Mask: Piece.PrevMask
+    Dm.X: 13
+    Dm.Y: 3
+    Dm.Col: 0
+    call DrawMask(_, base, temp, work, index, counter, slot, value, unit, item, admin)
+
+    // neuen Stein setzen
+    Piece.Type: Piece.NextType
+    Piece.Rot: 0
+    Piece.X: 3
+    Piece.Y: 0
+
+    prepare $b@Min: 0, $t@Max: 6
+    call ConsoleGfx.Rand(_, keep base, keep temp)
+    $b@Type: _
+    Piece.NextType: $b
+
+    // neue Vorschau
+    $i: Piece.NextType
+    $i *: 4
+    $u: Shapes[$i]
+    Piece.PrevMask: $u
+    Dm.Mask: $u
+    $i: Piece.NextType
+    $u: PColor[$i]
+    Dm.Col: $u
+    call DrawMask(_, base, temp, work, index, counter, slot, value, unit, item, admin)
+
+    // Stein auf Feld: passt nicht -> Game Over
+    $i: Piece.Type
+    $i *: 4
+    $u: Shapes[$i]
+    Dm.Mask: $u
+    Dm.X: Piece.X
+    Dm.Y: Piece.Y
+    call Blocked(_, base, temp, work, index, counter, slot, value, unit)
+    Game.Over: Try.Hit
+    $i: Piece.Type
+    $u: PColor[$i]
+    Dm.Col: $u
+    call DrawMask(_, base, temp, work, index, counter, slot, value, unit, item, admin)
+}
+
+// Stein liegt fest: Zeilen, Punkte, Level, naechster Stein
+private methode Lock(_, base, temp, work, index, counter, slot, value, unit, item, admin){
+
+    call ClearLines(_, base, temp, work, index, counter, slot, value, unit, item, admin)
+
+    // Punkte = Tabelle[Zeilen] * (Level + 1)
+    $i@Row: Line.Cleared
+    $w@Points: LineScore[@Row]
+    $b@Mult: Game.Level + 1
+    @Points *: @Mult
+    $b@Score: Game.Score
+    @Score +: @Points
+    Game.Score: @Score
+    $w@Best: Game.Best
+    compare(@Score <= @Best) goto_true Lines1
+    Game.Best: @Score
+
+    ->Lines1
+        $b@Total: Game.Lines
+        @Total +: Line.Cleared
+        Game.Lines: @Total
+        @Total /: LINES_PER_LEVEL
+        Game.Level: @Total
+        $w@Step: Game.Level * LEVEL_STEP
+        $b@Drop: DROP_START
+        @Drop -: @Step
+        compare(@Drop >= DROP_MIN) goto_true SetDrop
+        $b@Drop: DROP_MIN
+
+    ->SetDrop
+        Game.DropAt: @Drop
+
+        $b@Count: Line.Cleared
+        compare(@Count = 0) goto_true Plain
+        compare(@Count = 4) goto_true Four
+        $pB@Melody: SndLine
+        goto Beep
+
+    ->Four
+        $pB@Melody: SndTetris
+        goto Beep
+
+    ->Plain
+        $pB@Melody: SndLock
+
+    ->Beep
+        prepare $pB@Melody
+        call Sound.Play(=)
+
+    call Spawn(_, base, temp, work, index, counter, slot, value, unit, item, admin)
+    call ShowScore(_, base, temp, work, index, counter, slot, value, unit, item, admin)
+}
+
+// einen Schritt nach unten
+private methode Fall(_, base, temp, work, index, counter, slot, value, unit, item, admin){
+    Try.X: Piece.X
+    Try.Rot: Piece.Rot
+    $b@Y: Piece.Y + 1
+    Try.Y: @Y
+    call TryMove(_, base, temp, work, index, counter, slot, value, unit, item, admin)
+
+    $b@Hit: Try.Hit
+    compare(@Hit = 0) goto_true Moved
+
+    call Lock(_, base, temp, work, index, counter, slot, value, unit, item, admin)
+    Try.Hit: 1
+    return
+
+    ->Moved
+}
+
+// drehen, bei Wandkontakt mit Wandkorrektur
+private methode Rotate(_, base, temp, work, index, counter, slot, value, unit, item, admin){
+    $b@Rot: Piece.Rot + 1
+    @Rot &: 3
+    Try.Rot: @Rot
+    Try.Y: Piece.Y
+    Line.Kick: 0
+
+    ->Try
+        $i@Kick: Line.Kick
+        $b@NewX: Kick[@Kick]
+        @NewX +: Piece.X
+        Try.X: @NewX
+        call TryMove(_, base, temp, work, index, counter, slot, value, unit, item, admin)
+
+        $b@Hit: Try.Hit
+        compare(@Hit = 0) goto_true Done
+
+        $b@Next: Line.Kick
+        @Next++
+        Line.Kick: @Next
+        compare(@Next < 5) goto_true Try↑
+
+    ->Done
+}
+
+// Tasten lesen
+private methode ReadKeys(_, base, temp, work, index, counter, slot, value, unit, item, admin){
+    ->Next
+        call ConsoleGfx.GetKey(focus base, item, admin)
+        goto_flag not_carry Done
+        compare($b@Key = 113) goto_true Quit
+        compare($b = 27) goto_true Quit
+        compare($b = 112) goto_true Pause
+
+        $w@Paused: Game.Paused
+        compare($w = 1) goto_true Next↑
+        compare($b = 131) goto_true Left
+        compare($b = 97) goto_true Left
+        compare($b = 130) goto_true Right
+        compare($b = 100) goto_true Right
+        compare($b = 128) goto_true Turn
+        compare($b = 119) goto_true Turn
+        compare($b = 129) goto_true Down
+        compare($b = 115) goto_true Down
+        compare($b = 32) goto_true HardDrop
+        goto Next↑
+
+    ->Quit
+        Game.Quit: 1
+        goto Next↑
+
+    ->Pause
+        $b: Game.Paused
+        $b ^: 1
+        Game.Paused: $b
+        call ShowScore(_, base, temp, work, index, counter, slot, value, unit, item, admin)
+        goto Next↑
+
+    ->Left
+        $b@X: Piece.X - 1
+        goto Side
+
+    ->Right
+        $b@X: Piece.X + 1
+
+    ->Side
+        Try.X: $b@NewX
+        Try.Rot: Piece.Rot
+        Try.Y: Piece.Y
+        call TryMove(_, base, temp, work, index, counter, slot, value, unit, item, admin)
+        goto Next↑
+
+    ->Turn
+        call Rotate(_, base, temp, work, index, counter, slot, value, unit, item, admin)
+        goto Next↑
+
+    ->Down
+        call Fall(_, base, temp, work, index, counter, slot, value, unit, item, admin)
+        goto Next↑
+
+    ->HardDrop
+        call Fall(_, base, temp, work, index, counter, slot, value, unit, item, admin)
+        $b: Try.Hit
+        compare($b = 0) goto_true HardDrop↑
+        goto Next↑
+
+    ->Done
+}
+
+// Neues Spiel
+private methode NewGame(_, base, temp, work, index, counter, slot, value, unit, item, admin){
+    call ConsoleGfx.ShadowOn(_, keep admin)
+    $b: 0
+    call ConsoleGfx.Clear(base, item, admin)
+
+    // Rahmen: linke und rechte Wand, Boden (je Zelle Cell x Cell Punkte)
+    Line.Y: 0
+
+    ->Wall
+        $b@GridX: 0
+        $b--
+        $t@GridY: Line.Y
+        $w@Color: C_WALL
+        prepare $b@GridX, $t@GridY, $w@Color
+        call PutCell(_, base, temp, work, index, counter, slot, item, admin)
+
+        $b@GridX: FIELD_W
+        $t@GridY: Line.Y
+        $w@Color: C_WALL
+        prepare $b@GridX, $t@GridY, $w@Color
+        call PutCell(_, base, temp, work, index, counter, slot, item, admin)
+
+        $b@Row: Line.Y
+        $b++
+        Line.Y: $b
+        compare($b <= FIELD_H) goto_true Wall↑
+
+    Line.X: 0
+
+    ->Floor
+        $b@GridX: Line.X
+        $t@GridY: FIELD_H
+        $w@Color: C_WALL
+        prepare $b@GridX, $t@GridY, $w@Color
+        call PutCell(_, base, temp, work, index, counter, slot, item, admin)
+
+        $b@Col: Line.X
+        $b++
+        Line.X: $b
+        compare($b < FIELD_W) goto_true Floor↑
+
+    // Init all GameParams
+    Game.Score: 0
+    Game.Lines: 0
+    Game.Level: 0
+    Game.DropAt: DROP_START
+    Game.Tick: 0
+    Game.Paused: 0
+    Game.Over: 0
+    Piece.PrevMask: 0
+
+    $b@Min: 0
+    $t@Max: 6
+    prepare $b@Min, $t@Max
+    call ConsoleGfx.Rand(_, keep base, keep temp)
+    $b@Type: _
+    Piece.NextType: $b
+
+    call Spawn(_, base, temp, work, index, counter, slot, value, unit, item, admin)
+    call ShowScore(_, base, temp, work, index, counter, slot, value, unit, item, admin)
+}
+
+Start{
+    call ConsoleGfx.UpdateSize(_, item, keep admin)
+    call ConsoleGfx.Clear(=)
+
+    // groesste Zellgroesse suchen, bei der Feld und Vorschau ins Terminal passen
+    Field.Cell: CELL_MAX
+
+    ->Fit
+        $w@Cell: Field.Cell
+        compare($w = 0) goto_true TooSmall
+        $b@Need: $w
+        $b *: SPAN_H
+        $t@Have: ConsoleGfx.consoleGfxPub64.Height
+        compare($b > $t) goto_true Smaller
+        $b@Need: $w
+        $b *: SPAN_W
+        $t@Have: ConsoleGfx.consoleGfxPub64.Width
+        compare($b <= $t) goto_true Fitted
+
+        ->Smaller
+        $w@Cell: Field.Cell
+        $w--
+        Field.Cell: $w
+        goto Fit↑
+
+    ->Fitted
+        // Hoehe begrenzen: Score-Zeile soll nah am Feld stehen
+        $w@Cell: Field.Cell
+        $b@Rows: $w
+        $b *: SPAN_H
+        $b +: 8
+        $t@Have: ConsoleGfx.consoleGfxPub64.Height
+        compare($t <= $b) goto_true HeightOk
+        ConsoleGfx.consoleGfxPub64.Height: $b
+
+        ->HeightOk
+        // Feld mittig: OX = (Width - SPAN_W * Cell) / 2 + Cell, OY = (Height - SPAN_H * Cell) / 2
+        $w@Cell: Field.Cell
+        $b@Span: $w
+        $b *: SPAN_W
+        $t@Room: ConsoleGfx.consoleGfxPub64.Width
+        $t -: $b
+        $t /: 2
+        $t +: $w
+        Field.OX: $t
+        $b@Span: $w
+        $b *: SPAN_H
+        $t@Room: ConsoleGfx.consoleGfxPub64.Height
+        $t -: $b
+        $t /: 2
+        Field.OY: $t
+
+        Sound.soundPub32.Tempo: 180
+        call Sound.Start(_, item, admin)
+        call ConsoleGfx.RawOn(_, item, admin)
+        goto_flag not_carry NoTerminal
+
+        call ConsoleGfx.CursorOff(_, item, admin)
+        call NewGame(_, base, temp, work, index, counter, slot, value, unit, item, admin)
+
+    ->Loop
+        call ReadKeys(_, base, temp, work, index, counter, slot, value, unit, item, admin)
+
+        $b: Game.Quit
+        compare($b = 1) goto_true Finish
+        $b: Game.Over
+        compare($b = 1) goto_true GameOver
+        $b: Game.Paused
+        compare($b = 1) goto_true Idle
+
+        $b: Game.Tick
+        $b++
+        Game.Tick: $b
+        $w: Game.DropAt
+        compare($b < $w) goto_true Idle
+
+        Game.Tick: 0
+        call Fall(_, base, temp, work, index, counter, slot, value, unit, item, admin)
+
+        $b: Game.Over
+        compare($b = 1) goto_true GameOver
+
+        ->Idle
+            prepare $b@Millis: LOOP_MS
+            call ConsoleGfx.Sleep(keep base, item, admin)
+            goto Loop↑
+
+    ->GameOver
+        prepare $pB@Melody: SndOver
+        call Sound.Play(keep base, keep _, item, admin)
+
+        call ConsoleGfx.Present(_)
+        call ShowScore(_, base, temp, work, index, counter, slot, value, unit, item, admin)
+
+        prepare "\e[0m\e[41;1;37m\e["
+        call Basic.Print(=)
+
+        $b@Number: ConsoleGfx.consoleGfxPub64.Height
+        $b /: 2
+        $b++
+        prepare $b@Number
+        call Basic.PrintInt(=)
+
+        prepare $pB: ";"
+        call Basic.Print(=)
+
+        $b: ConsoleGfx.consoleGfxPub64.Width
+        $b -: 17
+        prepare $b
+        call Basic.PrintInt(=)
+
+        prepare "H  GAME OVER - r = neu, q = Ende  \e[0m"
+        call Basic.Print(=)
+
+    ->Wait
+        prepare 40
+        call ConsoleGfx.Sleep(keep base, item, admin)
+
+        call ConsoleGfx.GetKey(focus base, item, admin)
+        goto_flag not_carry Wait↑
+
+        compare($b@Key = 114) goto_true Again
+        compare($b = 113) goto_true Finish
+        compare($b = 27) goto_true Finish
+        goto Wait↑
+
+    ->Again
+        call NewGame(_, base, temp, work, index, counter, slot, value, unit, item, admin)
+        goto Loop↑
+
+    ->Finish
+        call ConsoleGfx.ShadowOff(_)
+        call Sound.Stop(_, item, admin)
+        call ConsoleGfx.RawOff(_, item, admin)
+        call ConsoleGfx.CursorOn(_, item, admin)
+
+        prepare "\e[0m\n"
+        call Basic.Print(=)
+        return
+
+    ->NoTerminal
+        prepare "Tetris braucht ein Terminal (stdin ist keins).\n"
+        call Basic.Print(=)
+        return
+
+    ->TooSmall
+        prepare "Terminal zu klein (mindestens 36 Spalten x 22 Zeilen).\n"
+        call Basic.Print(=)
+}
